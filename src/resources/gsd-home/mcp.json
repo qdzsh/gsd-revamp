@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "linkup": {
+      "type": "http",
+      "url": "https://mcp.linkup.so/mcp?apiKey=__SECRET_PLACEHOLDER__"
+    },
+    "ctxe": {
+      "type": "stdio",
+      "command": "ctxe",
+      "args": "mcp"
+    },
+    "context7": {
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp",
+      "headers": {
+        "CONTEXT7_API_KEY": "__CONTEXT7_API_KEY_PLACEHOLDER__"
+      }
+    }
+  }
+}

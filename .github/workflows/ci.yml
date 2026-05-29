@@ -1,0 +1,387 @@
+# CI workflow — builds, tests, and gates merges to main
+name: CI
+
+on:
+  push:
+    branches: [main, dev, test, 'hotfix/**']
+    paths-ignore:
+      - '.github/workflows/ai-triage.yml'
+      - '.github/workflows/build-native.yml'
+      - '.github/workflows/cleanup-dev-versions.yml'
+      - 'LICENSE'
+  pull_request:
+    branches: [main, dev, test]
+    paths-ignore:
+      - '.github/workflows/ai-triage.yml'
+      - '.github/workflows/build-native.yml'
+      - '.github/workflows/cleanup-dev-versions.yml'
+      - 'LICENSE'
+  workflow_dispatch:
+    inputs:
+      run_coverage:
+        description: Run coverage thresholds (default on main push only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Single checkout + classify + fast scans (~2–5 min). Replaces detect-changes,
+  # docs-check, and lint jobs so build can start as soon as this finishes.
+  fast-gates:
+    name: fast-gates
+    timeout-minutes: 8
+    runs-on: ubuntu-latest
+    outputs:
+      heavy-code-changed: ${{ steps.classify.outputs.heavy-code-changed }}
+      portability-changed: ${{ steps.classify.outputs.portability-changed }}
+      windows-e2e-changed: ${{ steps.classify.outputs.windows-e2e-changed }}
+      docker-changed: ${{ steps.classify.outputs.docker-changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare diff base for scans
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/ci-fetch-diff-base.sh
+
+      - name: Classify changed files
+        id: classify
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.sha }}
+        run: bash scripts/ci-classify-changes.sh
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Run fast gates
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/ci-fast-gates.sh
+
+  build:
+    name: build
+    timeout-minutes: 45
+    needs: [fast-gates]
+    if: needs.fast-gates.outputs.heavy-code-changed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build core
+        run: npm run build:core
+
+      - name: Pack build artifacts
+        run: bash scripts/ci-pack-build-artifacts.sh
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-build-artifacts
+          path: ci-build-artifacts.tar.gz
+          retention-days: 1
+
+      - name: Typecheck extensions
+        run: npm run typecheck:extensions
+
+      - name: Validate package is installable
+        run: npm run validate-pack
+
+      - name: Verify workspace coverage (every linkable package has tests)
+        run: npm run verify:workspace-coverage
+
+  test-unit:
+    name: test-unit
+    timeout-minutes: 20
+    needs: [fast-gates, build]
+    if: needs.fast-gates.outputs.heavy-code-changed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
+
+      - name: Restore build artifacts
+        run: bash scripts/ci-unpack-build-artifacts.sh
+
+      - name: Run unit tests
+        run: |
+          npm run test:compile
+          npm run test:unit:compiled
+
+  test-packages:
+    name: test-packages
+    timeout-minutes: 15
+    needs: [fast-gates, build]
+    if: needs.fast-gates.outputs.heavy-code-changed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
+
+      - name: Restore build artifacts
+        run: bash scripts/ci-unpack-build-artifacts.sh
+
+      - name: Run package tests
+        run: npm run test:packages:compiled
+
+  test-coverage:
+    name: test-coverage
+    timeout-minutes: 45
+    needs: [fast-gates, build]
+    if: >-
+      needs.fast-gates.outputs.heavy-code-changed == 'true' &&
+      (
+        (github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/test')) ||
+        (github.event_name == 'workflow_dispatch' && inputs.run_coverage)
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
+
+      - name: Restore build artifacts
+        run: bash scripts/ci-unpack-build-artifacts.sh
+
+      - name: Check test coverage thresholds
+        run: npm run test:coverage
+
+  integration-tests:
+    name: integration-tests
+    timeout-minutes: 15
+    needs: [fast-gates, build]
+    if: needs.fast-gates.outputs.heavy-code-changed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
+
+      - name: Restore build artifacts
+        run: bash scripts/ci-unpack-build-artifacts.sh
+
+      - name: Run integration tests
+        run: npm run test:integration
+
+  e2e:
+    name: e2e
+    timeout-minutes: 15
+    needs: [fast-gates, build]
+    if: needs.fast-gates.outputs.heavy-code-changed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
+
+      - name: Restore build artifacts
+        run: bash scripts/ci-unpack-build-artifacts.sh
+
+      - name: Run e2e suite (against built binary)
+        run: |
+          chmod +x dist/loader.js
+          export GSD_SMOKE_BINARY="$(pwd)/dist/loader.js"
+          npm run test:e2e
+
+      - name: Upload e2e artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: test-results/e2e
+          if-no-files-found: ignore
+          retention-days: 7
+
+  docker-e2e:
+    name: docker-e2e
+    timeout-minutes: 20
+    needs: [fast-gates, build]
+    if: >-
+      needs.fast-gates.outputs.heavy-code-changed == 'true' &&
+      needs.fast-gates.outputs.docker-changed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
+
+      - name: Restore build artifacts
+        run: bash scripts/ci-unpack-build-artifacts.sh
+
+      - name: Run docker e2e suite
+        run: npm run test:e2e:docker
+
+  windows-portability:
+    name: windows-portability
+    timeout-minutes: 25
+    needs: [fast-gates, build]
+    if: >-
+      needs.fast-gates.outputs.heavy-code-changed == 'true' &&
+      (needs.fast-gates.outputs.portability-changed == 'true' ||
+       needs.fast-gates.outputs.windows-e2e-changed == 'true')
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+          GSD_SKIP_RTK_INSTALL: '1'
+        run: npm ci --ignore-scripts
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
+
+      - name: Restore build artifacts
+        shell: bash
+        run: bash scripts/ci-unpack-build-artifacts.sh
+
+      - name: Typecheck extensions
+        if: needs.fast-gates.outputs.portability-changed == 'true'
+        run: npm run typecheck:extensions
+
+      - name: Run package tests
+        if: needs.fast-gates.outputs.portability-changed == 'true'
+        run: npm run test:packages
+
+      - name: Run Windows portability tests
+        if: needs.fast-gates.outputs.portability-changed == 'true'
+        run: >-
+          node --import ./src/resources/extensions/gsd/tests/resolve-ts.mjs
+          --experimental-strip-types --test
+          src/tests/windows-portability.test.ts
+          src/resources/extensions/gsd/tests/validate-directory.test.ts
+
+      - name: Run Windows e2e smoke suite (non-blocking)
+        id: windows-smoke-e2e
+        if: needs.fast-gates.outputs.windows-e2e-changed == 'true'
+        timeout-minutes: 10
+        shell: bash
+        continue-on-error: true
+        run: |
+          export GSD_SMOKE_BINARY="$(pwd)/dist/loader.js"
+          npm run test:e2e:windows-smoke
+
+      - name: Upload Windows e2e artifacts on failure
+        if: steps.windows-smoke-e2e.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts-windows
+          path: test-results/e2e
+          if-no-files-found: ignore
+          retention-days: 7

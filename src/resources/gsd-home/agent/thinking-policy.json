@@ -1,0 +1,14 @@
+{
+  "default": "high",
+  "prefixes": {
+    "research-": "high",
+    "discuss-": "high",
+    "plan-": "xhigh"
+  },
+  "unitTypes": {
+    "execute-task": "off",
+    "execute-task-simple": "off",
+    "reactive-execute": "high",
+    "replan-slice": "high"
+  }
+}

@@ -1,0 +1,341 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { join, parse } from "node:path";
+import { tmpdir } from "node:os";
+
+function overrideHomeEnv(homeDir: string): () => void {
+  const original = {
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
+    HOMEDRIVE: process.env.HOMEDRIVE,
+    HOMEPATH: process.env.HOMEPATH,
+  };
+
+  process.env.HOME = homeDir;
+  process.env.USERPROFILE = homeDir;
+
+  if (process.platform === "win32") {
+    const parsedHome = parse(homeDir);
+    process.env.HOMEDRIVE = parsedHome.root.replace(/[\\/]+$/, "");
+
+    const homePath = homeDir.slice(parsedHome.root.length).replace(/\//g, "\\");
+    process.env.HOMEPATH = homePath.startsWith("\\") ? homePath : `\\${homePath}`;
+  }
+
+  return () => {
+    if (original.HOME === undefined) delete process.env.HOME; else process.env.HOME = original.HOME;
+    if (original.USERPROFILE === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = original.USERPROFILE;
+    if (original.HOMEDRIVE === undefined) delete process.env.HOMEDRIVE; else process.env.HOMEDRIVE = original.HOMEDRIVE;
+    if (original.HOMEPATH === undefined) delete process.env.HOMEPATH; else process.env.HOMEPATH = original.HOMEPATH;
+  };
+}
+
+test("getExtensionKey normalizes top-level .ts and .js entry names to the same key", async () => {
+  const { getExtensionKey } = await import("../resource-loader.ts");
+  const extensionsDir = "/tmp/extensions";
+
+  assert.equal(
+    getExtensionKey("/tmp/extensions/ask-user-questions.ts", extensionsDir),
+    "ask-user-questions",
+  );
+  assert.equal(
+    getExtensionKey("/tmp/extensions/ask-user-questions.js", extensionsDir),
+    "ask-user-questions",
+  );
+  assert.equal(
+    getExtensionKey("/tmp/extensions/gsd/index.js", extensionsDir),
+    "gsd",
+  );
+});
+
+test("hasStaleCompiledExtensionSiblings detects installed format drift against the bundled root", async (t) => {
+  const { hasStaleCompiledExtensionSiblings } = await import("../resource-loader.ts");
+  const tmp = mkdtempSync(join(tmpdir(), "gsd-resource-loader-"));
+  const extensionsDir = join(tmp, "extensions");
+  const bundledDir = join(tmp, "bundled");
+
+  t.after(() => { rmSync(tmp, { recursive: true, force: true }); });
+
+  mkdirSync(bundledDir, { recursive: true });
+  mkdirSync(join(extensionsDir, "gsd"), { recursive: true });
+  writeFileSync(join(extensionsDir, "gsd", "index.ts"), "export {};\n");
+  assert.equal(hasStaleCompiledExtensionSiblings(extensionsDir, bundledDir), false);
+
+  writeFileSync(join(bundledDir, "ask-user-questions.js"), "export {};\n");
+  writeFileSync(join(extensionsDir, "ask-user-questions.js"), "export {};\n");
+  assert.equal(hasStaleCompiledExtensionSiblings(extensionsDir, bundledDir), false);
+
+  writeFileSync(join(extensionsDir, "ask-user-questions.ts"), "export {};\n");
+  assert.equal(hasStaleCompiledExtensionSiblings(extensionsDir, bundledDir), true);
+
+  writeFileSync(join(bundledDir, "ask-user-questions.ts"), "export {};\n");
+  assert.equal(hasStaleCompiledExtensionSiblings(extensionsDir, bundledDir), false);
+});
+
+test("hasStaleCompiledExtensionSiblings detects nested bundled extension format drift", async (t) => {
+  const { hasStaleCompiledExtensionSiblings } = await import("../resource-loader.ts");
+  const tmp = mkdtempSync(join(tmpdir(), "gsd-resource-loader-nested-"));
+  const extensionsDir = join(tmp, "extensions");
+  const bundledDir = join(tmp, "bundled");
+
+  t.after(() => { rmSync(tmp, { recursive: true, force: true }); });
+
+  mkdirSync(join(extensionsDir, "gsd", "auto"), { recursive: true });
+  mkdirSync(join(bundledDir, "gsd", "auto"), { recursive: true });
+
+  writeFileSync(join(extensionsDir, "gsd", "index.ts"), "export {};\n");
+  writeFileSync(join(extensionsDir, "gsd", "auto", "phases.ts"), "export {};\n");
+  writeFileSync(join(bundledDir, "gsd", "index.js"), "export {};\n");
+  writeFileSync(join(bundledDir, "gsd", "auto", "phases.js"), "export {};\n");
+
+  assert.equal(
+    hasStaleCompiledExtensionSiblings(extensionsDir, bundledDir),
+    true,
+    "source .ts files under bundled subdirectories must trigger a resync when the bundle has .js",
+  );
+});
+
+test("buildResourceLoader excludes duplicate top-level pi extensions when bundled resources use .js", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "gsd-resource-loader-home-"));
+  const piExtensionsDir = join(tmp, ".pi", "agent", "extensions");
+  const fakeAgentDir = join(tmp, ".gsd", "agent");
+  const restoreHomeEnv = overrideHomeEnv(tmp);
+
+  t.after(() => {
+    restoreHomeEnv();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  mkdirSync(piExtensionsDir, { recursive: true });
+  writeFileSync(join(piExtensionsDir, "ask-user-questions.ts"), "export {};\n");
+  writeFileSync(join(piExtensionsDir, "custom-extension.ts"), "export {};\n");
+
+  const { buildResourceLoader } = await import("../resource-loader.ts");
+  const loader = await buildResourceLoader(fakeAgentDir) as { additionalExtensionPaths?: string[] };
+  const additionalExtensionPaths = loader.additionalExtensionPaths ?? [];
+
+  assert.equal(
+    additionalExtensionPaths.some((entryPath) => entryPath.endsWith("ask-user-questions.ts")),
+    false,
+    "bundled compiled extensions should suppress duplicate pi top-level .ts siblings",
+  );
+  assert.equal(
+    additionalExtensionPaths.some((entryPath) => entryPath.endsWith("custom-extension.ts")),
+    true,
+    "non-duplicate pi extensions should still load",
+  );
+});
+
+test("buildResourceLoader includes caller-provided additional extension paths", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "gsd-resource-loader-cli-"));
+  const fakeAgentDir = join(tmp, ".gsd", "agent");
+  const cliExtensionPath = join(tmp, "cli-extension.ts");
+  const restoreHomeEnv = overrideHomeEnv(tmp);
+
+  t.after(() => {
+    restoreHomeEnv();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  writeFileSync(cliExtensionPath, "export {};\n");
+
+  const { buildResourceLoader } = await import("../resource-loader.ts");
+  const loader = await buildResourceLoader(fakeAgentDir, {
+    additionalExtensionPaths: [cliExtensionPath],
+  }) as { additionalExtensionPaths?: string[] };
+  const additionalExtensionPaths = loader.additionalExtensionPaths ?? [];
+
+  assert.equal(
+    additionalExtensionPaths.includes(cliExtensionPath),
+    true,
+    "caller-provided extension paths should be threaded into the resource loader",
+  );
+});
+
+test("initResources manifest tracks all bundled extension subdirectories including remote-questions (#2367)", async () => {
+  const { initResources } = await import("../resource-loader.ts");
+  const tmp = mkdtempSync(join(tmpdir(), "gsd-resource-loader-manifest-"));
+  const fakeAgentDir = join(tmp, "agent");
+
+  try {
+    initResources(fakeAgentDir, join(tmp, "skills"));
+
+    const manifestPath = join(fakeAgentDir, "managed-resources.json");
+    assert.equal(existsSync(manifestPath), true, "managed-resources.json should exist after initResources");
+
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    const installedDirs: string[] = manifest.installedExtensionDirs ?? [];
+
+    assert.equal(
+      manifest.packageName,
+      "gsd-revamp",
+      "managed resource manifest should be scoped to the package that wrote it",
+    );
+
+    // remote-questions uses mod.ts (not index.ts) as its entry point and has an
+    // extension-manifest.json — it must still appear in the manifest so that
+    // pruneRemovedBundledExtensions can track it across upgrades.
+    assert.ok(
+      installedDirs.includes("remote-questions"),
+      `installedExtensionDirs should include remote-questions but got: [${installedDirs.join(", ")}]`,
+    );
+
+    // Also verify that the synced remote-questions directory actually exists in the agent dir
+    assert.equal(
+      existsSync(join(fakeAgentDir, "extensions", "remote-questions")),
+      true,
+      "remote-questions directory should be synced to agent extensions",
+    );
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("initResources syncs bundled gsd-home defaults without models template", async () => {
+  const { initResources } = await import("../resource-loader.ts");
+  const tmp = mkdtempSync(join(tmpdir(), "gsd-resource-loader-gsd-home-"));
+  const fakeAgentDir = join(tmp, "agent");
+
+  try {
+    initResources(fakeAgentDir, join(tmp, "skills"));
+
+    assert.equal(existsSync(join(tmp, "mcp.json")), true, "global mcp.json default should be synced");
+    assert.equal(existsSync(join(tmp, "PREFERENCES.md")), true, "global PREFERENCES.md default should be synced");
+    assert.equal(existsSync(join(fakeAgentDir, "KNOWLEDGE.md")), false, "KNOWLEDGE.md is intentionally not bundled");
+    assert.equal(existsSync(join(fakeAgentDir, "mcp-trust.json")), true, "agent mcp-trust.json default should be synced");
+    assert.equal(existsSync(join(fakeAgentDir, "thinking-policy.json")), true, "agent thinking-policy.json default should be synced");
+    assert.equal(existsSync(join(fakeAgentDir, "models.json")), false, "models.json is intentionally not bundled");
+
+    JSON.parse(readFileSync(join(tmp, "mcp.json"), "utf-8"));
+    JSON.parse(readFileSync(join(fakeAgentDir, "mcp-trust.json"), "utf-8"));
+    JSON.parse(readFileSync(join(fakeAgentDir, "thinking-policy.json"), "utf-8"));
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("initResources backs up existing gsd-home defaults before overwrite", async () => {
+  const { initResources } = await import("../resource-loader.ts");
+  const tmp = mkdtempSync(join(tmpdir(), "gsd-resource-loader-gsd-home-backup-"));
+  const fakeAgentDir = join(tmp, "agent");
+
+  try {
+    mkdirSync(join(fakeAgentDir, "bin"), { recursive: true });
+    writeFileSync(join(tmp, "mcp.json"), "{\"old\":true}\n");
+    writeFileSync(join(tmp, "PREFERENCES.md"), "old preferences\n");
+    writeFileSync(join(fakeAgentDir, "KNOWLEDGE.md"), "old knowledge\n");
+    writeFileSync(join(fakeAgentDir, "thinking-policy.json"), "{\"old\":true}\n");
+    writeFileSync(join(fakeAgentDir, "bin", "gsd-thinking"), "old script\n");
+
+    initResources(fakeAgentDir, join(tmp, "skills"));
+
+    const rootEntries = readdirSync(tmp);
+    assert.ok(rootEntries.some((name) => name.startsWith("mcp.json.bk.")), "mcp.json should be backed up");
+    assert.ok(rootEntries.some((name) => name.startsWith("PREFERENCES.md.bk.")), "PREFERENCES.md should be backed up");
+
+    const agentEntries = readdirSync(fakeAgentDir);
+    assert.ok(agentEntries.some((name) => name.startsWith("thinking-policy.json.bk.")), "thinking-policy.json should be backed up");
+
+    const binEntries = readdirSync(join(fakeAgentDir, "bin"));
+    assert.ok(binEntries.some((name) => name.startsWith("gsd-thinking.bk.")), "bin scripts should be backed up");
+
+    assert.notEqual(readFileSync(join(tmp, "mcp.json"), "utf-8"), "{\"old\":true}\n");
+    assert.notEqual(readFileSync(join(tmp, "PREFERENCES.md"), "utf-8"), "old preferences\n");
+    assert.equal(readFileSync(join(fakeAgentDir, "KNOWLEDGE.md"), "utf-8"), "old knowledge\n");
+    assert.notEqual(readFileSync(join(fakeAgentDir, "thinking-policy.json"), "utf-8"), "{\"old\":true}\n");
+    assert.notEqual(readFileSync(join(fakeAgentDir, "bin", "gsd-thinking"), "utf-8"), "old script\n");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("initResources prunes stale top-level extension siblings next to bundled compiled extensions", async (t) => {
+  const { initResources } = await import("../resource-loader.ts");
+  const tmp = mkdtempSync(join(tmpdir(), "gsd-resource-loader-sync-"));
+  const fakeAgentDir = join(tmp, "agent");
+  const bundledTsPath = join(fakeAgentDir, "extensions", "ask-user-questions.ts");
+  const bundledJsPath = join(fakeAgentDir, "extensions", "ask-user-questions.js");
+
+  t.after(() => { rmSync(tmp, { recursive: true, force: true }); });
+
+  initResources(fakeAgentDir, join(tmp, "skills"));
+
+  const bundledPath = existsSync(bundledJsPath)
+    ? bundledJsPath
+    : bundledTsPath;
+  const staleSiblingPath = bundledPath.endsWith(".js")
+    ? bundledTsPath
+    : bundledJsPath;
+  const siblingWasBundled = existsSync(staleSiblingPath);
+  const staleContent = "export {};\n";
+
+  assert.equal(existsSync(bundledPath), true, "bundled top-level extension should exist");
+
+  // Simulate a stale opposite-format sibling left from a previous sync/build mismatch.
+  writeFileSync(staleSiblingPath, staleContent);
+  assert.equal(existsSync(staleSiblingPath), true);
+
+  // Force a full resync so this test exercises the prune/copy path rather than
+  // the early-return manifest fast path.
+  const manifestPath = join(fakeAgentDir, "managed-resources.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+  manifest.contentHash = "force-resync";
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+
+  initResources(fakeAgentDir, join(tmp, "skills"));
+
+  if (siblingWasBundled) {
+    assert.equal(existsSync(staleSiblingPath), true, "bundled sibling should be restored during sync");
+    assert.notEqual(readFileSync(staleSiblingPath, "utf-8"), staleContent, "bundled sibling should overwrite stale contents");
+  } else {
+    assert.equal(existsSync(staleSiblingPath), false, "stale top-level sibling should be removed during sync");
+  }
+  assert.equal(existsSync(bundledPath), true, "bundled extension should remain after cleanup");
+});
+
+test("pruneRemovedBundledExtensions removes stale subdirectory extensions not in current bundle", async () => {
+  const { initResources } = await import("../resource-loader.ts");
+  const tmp = mkdtempSync(join(tmpdir(), "gsd-resource-loader-prune-dirs-"));
+  const fakeAgentDir = join(tmp, "agent");
+
+  try {
+    // First sync — seeds the agent dir and writes the manifest.
+    initResources(fakeAgentDir, join(tmp, "skills"));
+
+    // Simulate a stale subdirectory extension left from a previous GSD version.
+    // This mirrors the mcporter scenario: it was bundled before, synced to
+    // ~/.gsd/agent/extensions/, then removed from the bundle in a newer version.
+    const staleExtDir = join(fakeAgentDir, "extensions", "mcporter");
+    mkdirSync(staleExtDir, { recursive: true });
+    writeFileSync(join(staleExtDir, "index.ts"), 'export default { name: "mcporter" };\n');
+    assert.equal(existsSync(staleExtDir), true, "stale subdir extension should exist before prune");
+
+    // Read the manifest to verify subdirectory extensions are tracked.
+    const manifestPath = join(fakeAgentDir, "managed-resources.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+
+    // The manifest must record installed extension directories so the pruner
+    // can detect when one has been removed from the bundle.
+    assert.ok(
+      Array.isArray(manifest.installedExtensionDirs),
+      "manifest should contain installedExtensionDirs array",
+    );
+
+    // Bump the manifest version to force a re-sync (simulates upgrading GSD).
+    manifest.gsdVersion = "0.0.0-force-resync";
+    manifest.contentHash = "0000000000000000";
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+
+    // Second sync — the bundle no longer contains mcporter/, so it must be pruned.
+    initResources(fakeAgentDir, join(tmp, "skills"));
+
+    assert.equal(
+      existsSync(staleExtDir),
+      false,
+      "stale subdirectory extension (mcporter/) should be pruned after upgrade",
+    );
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
