@@ -23,7 +23,7 @@ This is not a cosmetic rename of GSD Pi. Active development should treat `gsd-re
 
 ## Status
 
-The active baseline starts at version `1.0.0`.
+The active baseline starts at version `1.0.1`.
 
 Older upstream history may exist for traceability, but this repository should be reviewed and released from the `gsd-revamp` baseline forward.
 
@@ -137,7 +137,7 @@ npm run verify:pr
 
 ## Versioning
 
-The active public baseline starts at `1.0.0`.
+The active public baseline starts at `1.0.1`.
 
 Release notes should describe changes from the `gsd-revamp` baseline forward. Historical upstream refs are useful for auditing, but they are not the product narrative for this fork.
 

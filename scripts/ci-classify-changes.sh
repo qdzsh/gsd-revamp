@@ -15,7 +15,18 @@ else
   BASE="${CI_DIFF_REF:-origin/main}"
 fi
 
-FILES=$(git diff --name-only "$BASE" "$HEAD_SHA" 2>/dev/null || git diff --name-only HEAD~1)
+# Resolve changed files against the base. If the base is unreachable — e.g. a
+# force-pushed/squashed history, a shallow clone missing the base, or a root
+# commit with no parent — fall back to treating every tracked file as changed
+# so all gates run rather than the script crashing on a bad revision.
+if FILES=$(git diff --name-only "$BASE" "$HEAD_SHA" 2>/dev/null); then
+  :
+elif FILES=$(git diff --name-only "HEAD~1" "$HEAD_SHA" 2>/dev/null); then
+  :
+else
+  echo "::notice::Could not determine a diff base (root commit or unreachable base) — running all gates."
+  FILES=$(git ls-files)
+fi
 echo "Changed files:"
 echo "$FILES"
 
